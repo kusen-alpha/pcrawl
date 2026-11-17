@@ -1,0 +1,123 @@
+site_name: pcrawl
+site_description: 原生支持 purser 资源租约的 Scrapy 风格采集运行时
+docs_dir: docs
+site_dir: site
+
+# 发布后按实际部署地址填写；search.share、canonical 与 sitemap 依赖它。
+# site_url: https://your-domain.example/
+
+theme:
+  name: material
+  language: zh
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
+  features:
+    - navigation.sections
+    - navigation.indexes
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.top
+    - navigation.footer
+    - navigation.path
+    - navigation.tracking
+    - navigation.instant
+    - navigation.instant.prefetch
+    - navigation.instant.progress
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - content.tooltips
+    - content.footnote.tooltips
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/lightbulb-auto
+        name: 切换到浅色模式
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: amber
+      toggle:
+        icon: material/lightbulb
+        name: 切换到深色模式
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: amber
+      toggle:
+        icon: material/lightbulb-outline
+        name: 跟随系统
+
+extra_css:
+  - assets/stylesheets/extra.css
+
+extra_javascript:
+  - assets/javascripts/extra.js
+
+plugins:
+  - search:
+      lang: [zh]
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.betterem
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tilde
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+nav:
+  - 首页: index.md
+  - 上手:
+      - 概览: getting-started/index.md
+      - 安装: getting-started/install.md
+      - 第一个 Spider: getting-started/quickstart.md
+  - 指南:
+      - 概览: guides/index.md
+      - 任务与请求: guides/tasks-and-requests.md
+      - 执行模式: guides/execution-modes.md
+      - 资源会话: guides/resources.md
+      - 中间件与 Pipeline: guides/components.md
+      - 队列与持久化: guides/queues.md
+      - 配置分层: guides/configuration.md
+      - 信号与统计: guides/observability.md
+      - 关闭、重试与运维: guides/operations.md
+  - 参考:
+      - 概览: reference/index.md
+      - Spider 钩子: reference/spider.md
+      - Python API: reference/api.md
+      - CLI: reference/cli.md
+      - 配置项: reference/configuration.md
+      - 错误处理: reference/errors.md
+  - 设计与内部:
+      - 概览: design/index.md
+      - 整体架构: design/architecture.md
+      - 资源后端: design/resource-backends.md
+  - 贡献:
+      - 概览: contributing/index.md
+      - 测试与工程规范: contributing/testing.md
