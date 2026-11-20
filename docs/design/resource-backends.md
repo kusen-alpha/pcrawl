@@ -8,16 +8,14 @@ pcrawl 不实现资源池，只实现三种后端适配，把统一的 `Resource
 class ResourceBackend:
     async def start(self) -> None: ...
     async def close(self) -> None: ...
-    async def acquire(self, pool, *, name, tags, slots, use_limit,
-                      timeout, consumer, resource_id=None,
-                      required_tag=None, **kwargs) -> LeaseHandle: ...
+    async def acquire(self, pool, *, request: Mapping[str, Any]) -> LeaseHandle: ...
     async def release(self, handle, *, outcome, used) -> bool: ...
     async def renew(self, handle) -> bool: ...
     async def import_resources(self, pool, records, **kwargs): ...
     async def stats(self, pool): ...
 ```
 
-`ResourceManager` 是引擎持有的薄包装，负责传 `consumer`、`required_tag` 等字段并转发给后端。
+`ResourceManager` 是引擎持有的薄包装：把 `AcquireRequest` / mapping 归一化成普通 dict，注入 `consumer`，再转发给后端。
 
 ## 三种实现
 
@@ -39,8 +37,8 @@ purser_mode == auto:
 
 注意：
 
-- 声明了 `resources` 但没有任何池（`auto` 模式） → `ConfigError`，不会静默 `off`；
-- 显式 `off` + 声明资源 → 启动不报错，但首次 `acquire` 抛 `ResourceUnavailable`；
+- 旧的 `Spider.resources` 类变量 → 启动时 `ConfigError`，必须改用 `start_resources(resources)`；
+- 显式 `off` + `create_pool(...)` → `ConfigError`；
 - 显式 `embedded` + `thread/process` → 构造引擎时 `ConfigError`；
 - 显式 `local` + `inline/async` 是允许的，worker 通过 IPC 访问父进程 scheduler。
 
@@ -57,20 +55,21 @@ purser_mode == auto:
 
 ## `_EmbeddedBackend`
 
-在引擎进程内创建 `purser.Purser`：
+由 `ResourceRuntime` 在引擎进程内创建 `purser.Purser`，`_EmbeddedBackend` 只是它的视图：
 
 ```python
 Purser(
-    storage=setup.storage or settings.purser_storage,
-    coordination=setup.coordination or settings.purser_coordination,
-    sqlite_path=setup.sqlite_path or settings.purser_sqlite_path,
-    redis_url=setup.redis_url or settings.purser_redis_url,
+    storage=settings.purser_storage,
+    coordination=settings.purser_coordination,
+    sqlite_path=settings.purser_sqlite_path,
+    redis_url=settings.purser_redis_url,
 )
 ```
 
-- 先 `register_adapter`，再 `start`，再创建池；
-- 每个池的 `config` 自动补 `lease_ttl=settings.lease_ttl`；
-- `acquire` 直接调用 `pool.acquire(AcquireRequest(...))`，`LeaseHandle.resource` 就是原始对象；
+- 首次 `create_pool` 时创建 `Purser` 并注册 adapter；`start_resources` 中的 `import_resources` 会自动 `start`；
+- `_EmbeddedBackend.close()` 不关闭 `Purser`，生命周期归 `ResourceRuntime`；
+- 每个池的 `config` 自动补 `lease_ttl=settings.lease_ttl`（可通过 `create_pool(..., lease_ttl=...)` 覆盖）；
+- `acquire` 把归一化后的 request dict 转成 `AcquireRequest`，`LeaseHandle.resource` 就是原始对象；
 - `release` 把 `outcome.value` 字符串化后传给 purser；
 - `renew` 调用 `pool.renew_manual(raw)`；
 - `import_resources` / `stats` 直接代理到池对象。
@@ -103,7 +102,7 @@ scheduler.start()
 
 自定义资源类型跨进程需要两侧信息：
 
-1. 父进程：`ResourceSetup.adapters` 注册到 `LocalScheduler`；
+1. 父进程：`resources.register_adapter(...)` 注册到 `LocalScheduler`；
 2. 子进程：`resource_types` 映射 `kind → module:qualname`，由 `resource_type_paths(adapters)` 生成并放进 worker config。
 
 子进程启动时：
@@ -147,13 +146,13 @@ sequenceDiagram
     participant E as Engine
     participant B as Backend
     participant W as Worker
+    E->>B: start_resources: register_adapter / create_pool
+    E->>B: import_resources（必要时自动 start）
     E->>B: start()
-    E->>B: import seed
-    E->>E: setup_resources
     loop worker 会话
-        W->>B: acquire(session specs)
+        W->>B: Spider.open_session 中 acquire(session)
         W->>B: renew(heartbeat)
-        W->>B: acquire(request specs)
+        W->>B: acquire(request resources)
         W->>B: release(request)
         W->>B: release_all(session)
     end

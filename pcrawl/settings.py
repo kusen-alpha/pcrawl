@@ -51,7 +51,6 @@ _ALIASES = {
     "SPIDER_MIDDLEWARES": "spider_middlewares",
     "ITEM_PIPELINES": "item_pipelines",
     "PURSER_MODE": "purser_mode",
-    "PURSER_POOLS": "purser_pools",
     "PURSER_STORAGE": "purser_storage",
     "PURSER_COORDINATION": "purser_coordination",
     "PURSER_SQLITE_PATH": "purser_sqlite_path",
@@ -139,7 +138,6 @@ class Settings:
     item_pipelines: Any = ()
 
     purser_mode: PurserMode = "auto"
-    purser_pools: dict[str, dict[str, Any]] = field(default_factory=dict)
     purser_storage: str = "memory"
     purser_coordination: str = "memory"
     purser_sqlite_path: str | None = None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -16,16 +17,13 @@ from pcrawl import (
     MemoryRequestQueue,
     MemoryTaskQueue,
     MultiProcessSpider,
-    PoolSpec,
     RedisRequestQueue,
     RedisTaskQueue,
     Request,
     RequestFailure,
     ResourceOutcome,
-    ResourcePlan,
-    ResourceSetup,
-    ResourceSpec,
     ResourceInvalid,
+    ResourceRuntime,
     Response,
     Settings,
     Spider,
@@ -237,7 +235,6 @@ def test_process_mode_uses_shared_request_queue():
 def test_process_mode_with_local_scheduler_session_resources():
     settings = _fast_settings(workers=2).replace(
         purser_mode="local",
-        purser_pools={"account": {"kind": "account", "max_slots": 1}},
         resource_wait_timeout=8,
     )
     stats = CrawlerEngine(ProcessSessionSpider, settings).run()
@@ -249,31 +246,27 @@ def test_embedded_purser_session_resources():
     settings = _fast_settings(
         concurrency=2,
         purser_mode="embedded",
-        purser_pools={"account": {"kind": "account", "max_slots": 1}},
         resource_wait_timeout=5,
     )
     stats = CrawlerEngine(AsyncSessionSpider, settings).run()
     assert stats["item_scraped"] == AsyncSessionSpider.count
 
 
-def test_resource_setup_normalizes_pool_declarations():
-    setup = ResourceSetup(
-        pools={
-            "account": {
-                "kind": "account",
-                "max_slots": 1,
-                "seed": {"id": "a1", "username": "u1"},
-                "import_options": {"import_validate": "on_import"},
-            }
-        }
-    )
+def test_resource_runtime_uses_purser_native_pool_api():
+    async def scenario():
+        runtime = ResourceRuntime(Settings(), "async")
+        pool = runtime.create_pool("account", "account", config={"max_slots": 1})
+        report = await pool.import_resources(
+            [{"id": "a1", "username": "u1"}],
+            import_validate="on_import",
+        )
+        await runtime.start()
+        assert runtime.resolved_mode == "embedded"
+        assert runtime.pool_names == ("account",)
+        assert report.total == 1
+        await runtime.close()
 
-    pool = setup.pools["account"]
-    assert isinstance(pool, PoolSpec)
-    assert pool.kind == "account"
-    assert pool.config == {"max_slots": 1}
-    assert pool.seed == ({"id": "a1", "username": "u1"},)
-    assert ResourceSetup.from_value({"pools": setup.pools}) == setup
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(
@@ -311,17 +304,17 @@ def test_process_mode_runs_without_resources():
     stats = engine.run()
 
     assert engine.settings.purser_mode == "off"
-    assert engine.scheduler is None
+    assert engine.resource_runtime is None
     assert stats["task_received"] == _ProcessItemSpider.count
     assert stats["task_succeeded"] == _ProcessItemSpider.count
     assert stats["item_scraped"] == _ProcessItemSpider.count
 
 
-def test_auto_resource_plan_requires_pool_declaration():
+def test_legacy_resources_class_attribute_is_rejected():
     class DeclaredOnlySpider(AsyncSpider):
         resources = {"account": {"pool": "account"}}
 
-    with pytest.raises(ConfigError, match="no resource pools"):
+    with pytest.raises(ConfigError, match="start_resources"):
         CrawlerEngine(DeclaredOnlySpider, _fast_settings()).run()
 
 
@@ -345,14 +338,14 @@ class _FakeBackend(ResourceBackend):
         self.released: list[tuple[str, str, int]] = []
         self.renewed = 0
 
-    async def acquire(self, pool, *, name, tags, slots, use_limit, timeout, consumer, **kwargs):
-        raw = _FakeLease(f"tok-{name}", f"rid-{name}", {"username": name})
+    async def acquire(self, pool, *, request):
+        raw = _FakeLease(f"tok-{pool}", f"rid-{pool}", {"username": pool})
         return LeaseHandle(
-            name=name,
+            name=pool,
             pool=pool,
             raw=raw,
             backend=self,
-            use_limit=use_limit,
+            use_limit=request.get("use_limit"),
         )
 
     async def release(self, handle, *, outcome, used):
@@ -368,12 +361,8 @@ def test_session_marks_usage_and_releases_outcome():
     async def scenario():
         backend = _FakeBackend()
         manager = ResourceManager(backend, Settings())
-        session = WorkerSession(
-            manager=manager,
-            plan=ResourcePlan.from_value({"account": ResourceSpec("account", use_limit=2)}),
-            worker_id="w1",
-        )
-        handle = await session.acquire("account")
+        session = WorkerSession(manager=manager, worker_id="w1")
+        handle = await session.acquire("account", {"use_limit": 2})
         assert handle.payload["username"] == "account"
         assert handle.tags == frozenset({"t1"})
         handle.mark_used()
@@ -391,11 +380,7 @@ def test_session_heartbeat_renews_session_leases():
     async def scenario():
         backend = _FakeBackend()
         manager = ResourceManager(backend, Settings())
-        session = WorkerSession(
-            manager=manager,
-            plan=ResourcePlan.from_value({"account": ResourceSpec("account")}),
-            worker_id="w1",
-        )
+        session = WorkerSession(manager=manager, worker_id="w1")
         await session.acquire("account")
         session.start_heartbeat(0.01)
         await asyncio.sleep(0.05)
@@ -476,19 +461,69 @@ def test_request_serialization_preserves_bytes_and_callable_name():
         method="POST",
         body=b"\x00\xff",
         callback=spider.parse,
-        resource_specs={"proxy": {"pool": "proxy"}},
+        resources={"proxy": {"pool": "proxy"}},
         parent_task_id="task-1",
     )
     restored = Request.from_dict(request.to_dict())
     assert restored.body == b"\x00\xff"
     assert restored.callback == "parse"
-    assert restored.resource_specs == {"proxy": {"pool": "proxy"}}
+    assert restored.resources == {"proxy": {"pool": "proxy"}}
     assert restored.parent_task_id == "task-1"
     assert restored.id == request.id
 
     legacy = request.to_dict()
-    legacy["resources"] = legacy.pop("resource_specs")
-    assert Request.from_dict(legacy).resource_specs == request.resource_specs
+    legacy["resource_specs"] = legacy.pop("resources")
+    assert Request.from_dict(legacy).resources == request.resources
+
+
+def test_request_level_resource_lease_round_trip():
+    purser = pytest.importorskip("purser")
+    seen: list[str] = []
+
+    with _Server() as server:
+        class RequestResourceSpider(Spider):
+            name = "request-resource"
+
+            async def start_resources(self, resources):
+                resources.create_pool("account", "account", config={"max_slots": 1})
+                await resources.import_resources(
+                    "account",
+                    [{"id": "a1", "username": "u1"}],
+                    import_validate="on_import",
+                )
+
+            def start_requests(self):
+                yield Request(
+                    server.base_url + "/",
+                    resources={"account": purser.AcquireRequest(use_limit=3)},
+                )
+
+            def parse(self, response):
+                snapshot = response.meta["pcrawl_resources"]["account"]
+                seen.append(snapshot["payload"]["username"])
+                yield Item(account=snapshot["payload"]["username"])
+
+        stats = CrawlerEngine(RequestResourceSpider, _fast_settings()).run()
+
+    assert seen == ["u1"]
+    assert stats["item_scraped"] == 1
+
+
+def test_request_serializes_purser_acquire_request():
+    purser = pytest.importorskip("purser")
+    request = Request(
+        "http://example.com/",
+        resources={
+            "proxy": purser.AcquireRequest(tags={"b", "a"}, use_limit=2),
+        },
+    )
+    data = request.to_dict()
+
+    assert data["resources"]["proxy"]["tags"] == ["a", "b"]
+    assert data["resources"]["proxy"]["use_limit"] == 2
+    json.dumps(data)
+    restored = Request.from_dict(data)
+    assert restored.resources["proxy"]["use_limit"] == 2
 
 
 def test_redis_queue_visibility_timeout_requeues_crashed_task(monkeypatch):

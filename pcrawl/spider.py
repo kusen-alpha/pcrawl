@@ -7,7 +7,7 @@ from typing import Any, ClassVar, Literal
 
 from .exceptions import ConfigError
 from .http import Request, Response
-from .resources import LeaseHandle, ResourcePlan, ResourceSetup, WorkerSession
+from .resources import LeaseHandle, ResourceRuntime, WorkerSession
 from .settings import Settings
 from .task import Task
 
@@ -60,7 +60,6 @@ class Spider:
     execution_mode: ClassVar[ExecutionMode] = "inline"
     name: str = ""
     start_urls: tuple[str, ...] = ()
-    resources: ResourcePlan | dict[str, Any] | None = None
     # Class-level ``settings`` keeps the legacy override path;
     # ``custom_settings`` is the Scrapy-style per-spider partial override.
     settings: Settings | Mapping[str, Any] | None = None
@@ -73,10 +72,6 @@ class Spider:
     @property
     def logger(self) -> logging.Logger:
         return logging.getLogger(f"pcrawl.spider.{self.name or type(self).__name__}")
-
-    @property
-    def resource_plan(self) -> ResourcePlan:
-        return ResourcePlan.from_value(self.resources)
 
     def start_tasks(self, ctx: SpiderContext | None = None):
         """Yield initial durable ``Task`` objects for the engine queue.
@@ -146,9 +141,11 @@ class Spider:
     def open_session(self, session: WorkerSession) -> None:
         """Create browser/account state here.
 
-        Raise :class:`pcrawl.exceptions.ResourceInvalid` when the leased
-        resource is unusable so the runtime can release it with the right
-        outcome.
+        Acquire session-scoped leases explicitly with
+        ``await session.acquire(pool, AcquireRequest(...))`` (or keyword
+        overrides). Raise :class:`pcrawl.exceptions.ResourceInvalid` when the
+        leased resource is unusable so the runtime can release it with the
+        right outcome.
         """
 
         return None
@@ -177,22 +174,30 @@ class Spider:
             "resource": handle.resource,
         }
 
-    def start_resources(self, ctx: ResourceContext | None = None) -> ResourceSetup | None:
-        """Declare purser pools and their initial records.
+    def start_resources(
+        self,
+        resources: ResourceRuntime,
+        ctx: ResourceContext | None = None,
+    ) -> None:
+        """Provision purser adapters, pools and initial records.
 
-        The engine calls this once before workers start and chooses the
-        concrete backend from the Spider execution mode. Return a
-        :class:`ResourceSetup` (or a mapping); do not return live
-        ``Purser``/``ResourcePool`` objects.
-        """
+        ``resources`` is a purser-shaped facade. Use it exactly like a
+        ``Purser`` instance::
 
-        return None
+            def start_resources(self, resources):
+                resources.register_adapter(DeviceAdapter())
+                pool = resources.create_pool(
+                    "device", "device", config={"max_slots": 1}
+                )
+                await pool.import_resources(
+                    [DeviceResource(id="d1", serial="SN-1")],
+                    import_validate="on_import",
+                )
 
-    def setup_resources(self, resources: Any, ctx: ResourceContext | None = None) -> None:
-        """Optional hook for live resource work after pools are started.
-
-        Use ``start_resources`` for normal declarations. Override this when
-        records must be imported lazily or generated after the backend starts.
+        The engine owns the concrete backend (embedded purser for inline/async,
+        parent-owned LocalScheduler for thread/process) and calls this hook once
+        before workers start. Do not return a value and do not create live
+        ``Purser`` objects.
         """
 
         return None

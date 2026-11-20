@@ -50,7 +50,7 @@ request = Request(
     meta={"timeout": 10},
     priority=5,
     route="shop-a",
-    resource_specs={"proxy": {"pool": "proxy"}},
+    resources={"proxy": {"tags": ["residential"]}},
 )
 ```
 
@@ -64,7 +64,7 @@ request = Request(
 | `priority` | 队列优先级；重试时按 `request_retry_priority_adjust` 调整 |
 | `dont_filter` | 绕过请求去重 |
 | `route` | 路由；`follow()` 默认沿用 |
-| `resource_specs` | request 级资源声明，见[资源会话](resources.md) |
+| `resources` | request 级资源声明，key 为池名，value 为 `AcquireRequest` / mapping，见[资源会话](resources.md) |
 | `retries` / `max_retries` | 请求级重试计数与上限 |
 | `parent_task_id` | 关联的上游 Task；由框架自动填充 |
 

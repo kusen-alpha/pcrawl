@@ -65,7 +65,7 @@ default = myproject.settings
 | `DOWNLOADER_MIDDLEWARES` | `downloader_middlewares` |
 | `SPIDER_MIDDLEWARES` | `spider_middlewares` |
 | `ITEM_PIPELINES` | `item_pipelines` |
-| `PURSER_MODE` / `PURSER_POOLS` | `purser_mode` / `purser_pools` |
+| `PURSER_MODE` | `purser_mode` |
 | `QUEUE_ORDER` / `REDIS_URL` / `REDIS_KEY` | 同名语义 |
 | `LOG_LEVEL` | `log_level` |
 
@@ -131,7 +131,6 @@ assert settings.get("myplugin_batch") == 100
 | `spider_middlewares` | `()` | Spider 中间件声明 |
 | `item_pipelines` | `()` | Item Pipeline 声明 |
 | `purser_mode` | `auto` | `auto` / `off` / `embedded` / `local` |
-| `purser_pools` | `{}` | 替代 `start_resources` 的池声明 |
 | `purser_storage` | `memory` | purser 存储层 |
 | `purser_coordination` | `memory` | purser 协调层 |
 | `purser_sqlite_path` | `None` | SQLite 路径 |

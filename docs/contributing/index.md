@@ -28,7 +28,7 @@ py -3.10 -m mkdocs serve -a 127.0.0.1:8001
 - 目标 Python 3.10，行宽 100；
 - 公开接口保持同步/异步都可调用，使用现有 `maybe_await` / `call_*` 辅助函数；
 - 新增配置项必须进入 `Settings` 字段并补 `validate()`，Scrapy 别名按需加入 `_ALIASES`；
-- 资源声明必须可序列化，不要把 live 对象塞进 `ResourceSetup` / `Task` / `Request`；
+- 资源池统一在 `start_resources(resources)` 中通过 purser 原生 API 创建；`Task` / `Request` 只携带可序列化字段；
 - 进程模式新增的类必须可在模块顶层导入（`spawn` 会重新导入）；
 - 不改变 `execution_mode` 的来源，也不新增覆盖它的配置。
 

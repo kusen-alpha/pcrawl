@@ -30,11 +30,10 @@ from .queue import (
     TaskQueue,
 )
 from .resources import (
+    ImportReport,
     LeaseHandle,
-    PoolSpec,
-    ResourcePlan,
-    ResourceSetup,
-    ResourceSpec,
+    PoolHandle,
+    ResourceRuntime,
     WorkerSession,
 )
 from .settings import Settings
@@ -71,6 +70,7 @@ __all__ = [
     "CrawlerEngine",
     "ITEM_SCRAPED",
     "IgnoreRequest",
+    "ImportReport",
     "Item",
     "LeaseHandle",
     "MemoryRequestQueue",
@@ -78,7 +78,7 @@ __all__ = [
     "MultiProcessSpider",
     "MultiThreadSpider",
     "PcrawlError",
-    "PoolSpec",
+    "PoolHandle",
     "QueueError",
     "RedisRequestQueue",
     "RedisTaskQueue",
@@ -89,9 +89,7 @@ __all__ = [
     "ResourceError",
     "ResourceInvalid",
     "ResourceOutcome",
-    "ResourcePlan",
-    "ResourceSetup",
-    "ResourceSpec",
+    "ResourceRuntime",
     "ResourceUnavailable",
     "Response",
     "SESSION_CLOSED",

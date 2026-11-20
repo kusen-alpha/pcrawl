@@ -9,7 +9,6 @@
 | `execution_mode` | `"inline"` | 由基类决定，不要手改 |
 | `name` | 类名 | worker id 与 logger 后缀 |
 | `start_urls` | `()` | 基础 `start_tasks` 使用的 URL 元组 |
-| `resources` | `None` | 逻辑名 → `ResourceSpec` 的映射或 `ResourcePlan` |
 | `settings` | `None` | `Settings` 或映射，仅显式值覆盖上一层 |
 | `custom_settings` | `{}` | Scrapy 风格的 per-spider 覆盖 |
 
@@ -28,7 +27,7 @@
 sequenceDiagram
     participant E as Engine
     participant S as Spider
-    E->>S: start_resources(ctx)
+    E->>S: start_resources(resources)
     E->>S: open_spider()
     Note over E,S: 启动队列与 worker
     loop 每个 worker 会话
@@ -42,22 +41,20 @@ sequenceDiagram
 
 ## 方法与调用时机
 
-### `start_resources(ctx=None)`
+### `start_resources(resources, ctx=None)`
 
-启动阶段调用一次，返回 `ResourceSetup` 或映射。用于声明池、seed、adapter 和后端参数。
+启动阶段调用一次。`resources` 是与 `Purser` 同形的 `ResourceRuntime` 门面：
 
 ```python
-def start_resources(self, ctx=None):
-    return ResourceSetup(pools={...})
+async def start_resources(self, resources):
+    resources.create_pool("account", "account", config={"max_slots": 1})
+    await resources.import_resources("account", records, import_validate="on_import")
 ```
 
-- 返回 `None` 等价于空声明；
-- 不能返回 live `Purser` / `ResourcePool`；
+- 不返回值；返回非 `None` 会报 `ConfigError`；
+- 用 `resources.register_adapter()` / `create_pool()` / `import_resources()` 完成 provisioning；
+- 不支持旧的 `Spider.resources` 类变量；
 - 在 `open_spider` 之前、worker 启动之前执行。
-
-### `setup_resources(resources, ctx=None)`
-
-资源后端启动、seed 导入之后调用一次。`resources` 是 `ResourceManager`，用于惰性导入或生成资源。
 
 ### `open_spider()`
 
@@ -112,15 +109,15 @@ def parse(self, response, ctx=None):
 每个 worker 会话开始/结束时调用：
 
 ```python
-def open_session(self, session):
-    account = session.get("account")
+async def open_session(self, session):
+    account = await session.acquire("account", {"use_limit": 10})
     session.user["client"] = Client(account.payload)
 
 def close_session(self, session, reason):
     session.user["client"].close()
 ```
 
-- 会话级资源已在此前获取；请求级资源不在这里；
+- session 租约在 `open_session` 中按需 `acquire`；请求级资源不在这里；
 - `open_session` 抛 `ResourceInvalid(outcome)` 会按该 outcome 归还租约并重建会话；
 - `close_session` 抛异常只记日志，租约仍会释放；
 - `process` 模式下每个子进程的 Spider 实例各调用一次。
@@ -161,7 +158,7 @@ worker 全部结束后调用一次。`reason` 取值：
 
 ### `ResourceContext`
 
-`start_resources` / `setup_resources` 可用：
+`start_resources` 可用：
 
 | 字段 | 说明 |
 | --- | --- |
@@ -190,7 +187,7 @@ worker 全部结束后调用一次。`reason` 取值：
 | `leases` | 逻辑名 → `LeaseHandle` |
 | `user` | worker 本地可变状态 |
 | `get(name)` / `session[name]` | 获取租约，缺失抛 `KeyError` |
-| `acquire(name, spec=None)` | 额外获取租约 |
+| `acquire(pool, lease=None, **overrides)` | 获取 session 租约；`lease` 接受 `AcquireRequest` / mapping |
 | `release(name, outcome=None, used=None)` | 释放单个租约 |
 | `invalidate(outcome)` | 标记会话内全部租约为该 outcome |
 | `start_heartbeat(interval)` / `stop_heartbeat()` | 手动控制续租 |

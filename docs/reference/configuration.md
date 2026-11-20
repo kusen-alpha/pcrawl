@@ -54,7 +54,6 @@ Settings.load(
 | `spider_middlewares` | 任意组件声明 | `()` | Spider 中间件 |
 | `item_pipelines` | 任意组件声明 | `()` | Item Pipeline |
 | `purser_mode` | `"auto" \| "off" \| "embedded" \| "local"` | `auto` | 资源后端选择 |
-| `purser_pools` | `dict[str, dict]` | `{}` | 池声明，和 `start_resources` 合并 |
 | `purser_storage` | `str` | `memory` | purser 存储层 |
 | `purser_coordination` | `str` | `memory` | purser 协调层 |
 | `purser_sqlite_path` | `str \| None` | `None` | SQLite 路径 |
@@ -96,7 +95,6 @@ Settings.load(
 | `SPIDER_MIDDLEWARES` | `spider_middlewares` |
 | `ITEM_PIPELINES` | `item_pipelines` |
 | `PURSER_MODE` | `purser_mode` |
-| `PURSER_POOLS` | `purser_pools` |
 | `PURSER_STORAGE` | `purser_storage` |
 | `PURSER_COORDINATION` | `purser_coordination` |
 | `PURSER_SQLITE_PATH` | `purser_sqlite_path` |
@@ -123,20 +121,4 @@ Settings.load(
 
 构造引擎时还会拒绝 `thread` / `process` + 显式 `purser_mode="embedded"`。
 
-## 池声明合并
-
-`purser_pools` 的优先级低于 `start_resources` 返回的 `pools`，同名池会被后者覆盖：
-
-```python
-settings = Settings(
-    purser_pools={
-        "proxy": {
-            "kind": "proxy",
-            "config": {"max_slots": 50},
-            "seed": [{"id": "p1", "url": "http://127.0.0.1:8080"}],
-        }
-    }
-)
-```
-
-适合把静态池放在设置模块，把动态 seed 留在 Spider 里。
+资源池本身不再通过 `Settings` 声明；统一在 `start_resources(resources)` 中调用 `resources.create_pool(...)`。

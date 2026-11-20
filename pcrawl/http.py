@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 from urllib.parse import urljoin as _urljoin
 
+from .resources import lease_request_payload
 from .utils import serialize_callable
 
 
@@ -30,7 +31,7 @@ class Request:
     priority: int = 0
     dont_filter: bool = False
     route: str = ""
-    resource_specs: dict[str, Any] = field(default_factory=dict)
+    resources: dict[str, Any] = field(default_factory=dict)
     retries: int = 0
     max_retries: int | None = None
     parent_task_id: str | None = None
@@ -49,7 +50,7 @@ class Request:
             "priority": self.priority,
             "dont_filter": self.dont_filter,
             "route": self.route,
-            "resource_specs": dict(self.resource_specs),
+            "resources": dict(self.resources),
             "retries": self.retries,
             "max_retries": self.max_retries,
             "parent_task_id": self.parent_task_id,
@@ -78,7 +79,10 @@ class Request:
             "priority": self.priority,
             "dont_filter": self.dont_filter,
             "route": self.route,
-            "resource_specs": dict(self.resource_specs),
+            "resources": {
+                name: lease_request_payload(value)
+                for name, value in self.resources.items()
+            },
             "retries": self.retries,
             "max_retries": self.max_retries,
             "parent_task_id": self.parent_task_id,
@@ -101,8 +105,8 @@ class Request:
             priority=int(data.get("priority") or 0),
             dont_filter=bool(data.get("dont_filter")),
             route=str(data.get("route") or ""),
-            resource_specs=dict(
-                data.get("resource_specs", data.get("resources")) or {}
+            resources=dict(
+                data.get("resources", data.get("resource_specs")) or {}
             ),
             retries=int(data.get("retries") or 0),
             max_retries=data.get("max_retries"),

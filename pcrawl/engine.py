@@ -32,22 +32,20 @@ from .queue import (
     task_queue_from_config,
 )
 from .resources import (
-    PoolSpec,
     ResourceManager,
-    ResourceSetup,
+    ResourceRuntime,
     WorkerSession,
     make_backend,
     resource_type_paths,
 )
 from .runtime import WorkerRuntime
-from .settings import PurserMode, Settings
+from .settings import Settings
 from .signals import SPIDER_CLOSED, SPIDER_OPENED, SignalManager
 from .spider import ExecutionMode, ResourceContext, Spider, SpiderContext
 from .stats import Stats
 from .task import Task
 from .utils import (
     accepts_no_required_args,
-    build_components,
     call_maybe_ctx,
     call_with_context,
     iter_results,
@@ -89,7 +87,7 @@ class CrawlerEngine:
         self.signals = signals or SignalManager()
         self.stats = stats or Stats()
         self.resources: ResourceManager | None = None
-        self.scheduler: Any = None
+        self.resource_runtime: ResourceRuntime | None = None
         self._manager: Any = None
         self._task_queue: TaskQueue | None = None
         self._request_queue: RequestQueue | None = None
@@ -200,109 +198,41 @@ class CrawlerEngine:
 
     async def _start_resources(self) -> None:
         ctx = ResourceContext(spider=self.spider, settings=self.settings, mode=self.mode)
-        setup = await self._call_start_resources(ctx)
-        pools = self._merge_pools(setup)
-        purser_mode = self._resolve_purser_mode(pools)
-        self.settings.purser_mode = purser_mode
-        if self.mode in ("thread", "process") and purser_mode == "embedded":
+        legacy = getattr(self.spider, "resources", None)
+        if legacy:
             raise ConfigError(
-                "embedded purser cannot be shared across threads/processes; "
-                "use purser_mode='local' or leave it on 'auto'"
+                "Spider.resources has been removed; declare pools inside "
+                "start_resources(resources) with resources.create_pool(...)"
             )
 
-        adapters = tuple(build_components(setup.adapters, self.settings))
-        self._resource_type_paths = resource_type_paths(adapters)
-        if purser_mode == "local":
-            from purser.local import LocalScheduler
-
-            self.scheduler = LocalScheduler(
-                storage=setup.storage or self.settings.purser_storage,
-                coordination=setup.coordination or self.settings.purser_coordination,
-                sqlite_path=setup.sqlite_path or self.settings.purser_sqlite_path,
-                redis_url=setup.redis_url or self.settings.purser_redis_url,
-                start_method=self.settings.purser_start_method,
-                adapters=adapters,
-            )
-            self.scheduler.start()
-            self._create_local_pools(pools)
-
-        resolved_setup = ResourceSetup(
-            pools=pools,
-            adapters=adapters,
-            storage=setup.storage,
-            coordination=setup.coordination,
-            sqlite_path=setup.sqlite_path,
-            redis_url=setup.redis_url,
-        )
-        backend = make_backend(self.settings, self.scheduler, resolved_setup)
-        self.resources = ResourceManager(backend, self.settings)
-        await self.resources.start()
-        await self._import_seed_resources(pools)
-        await self._call_setup_resources(ctx)
-
-    async def _call_start_resources(self, ctx: ResourceContext) -> ResourceSetup:
+        runtime = ResourceRuntime(self.settings, self.mode)
+        self.resource_runtime = runtime
         hook = getattr(self.spider, "start_resources", None)
-        if hook is None:
-            return ResourceSetup()
-        return ResourceSetup.from_value(await call_maybe_ctx(hook, ctx))
-
-    def _merge_pools(self, setup: ResourceSetup) -> dict[str, PoolSpec]:
-        pools = {
-            name: PoolSpec.from_value(value)
-            for name, value in self.settings.purser_pools.items()
-        }
-        pools.update(setup.pools)
-        return pools
-
-    def _resolve_purser_mode(self, pools: dict[str, PoolSpec]) -> PurserMode:
-        configured = self.settings.purser_mode
-        if configured != "auto":
-            return configured
-        if not pools:
-            if self.spider.resource_plan.specs:
+        if hook is not None:
+            result = await call_with_context(hook, runtime, ctx)
+            if result is not None:
                 raise ConfigError(
-                    "resources are declared but no resource pools are configured; "
-                    "return ResourceSetup from start_resources or set purser_pools"
+                    "start_resources must not return a value; use the resources "
+                    "argument to register adapters, create pools and import records"
                 )
-            return "off"
-        if self.mode in ("inline", "async"):
-            return "embedded"
-        return "local"
 
-    def _create_local_pools(self, pools: dict[str, PoolSpec]) -> None:
-        for name, spec in pools.items():
-            config = dict(spec.config)
-            config.setdefault("lease_ttl", self.settings.lease_ttl)
-            self.scheduler.create_pool(name, spec.kind, config=config)
-
-    async def _import_seed_resources(self, pools: dict[str, PoolSpec]) -> None:
-        if self.resources is None:
-            return
-        for name, spec in pools.items():
-            if not spec.seed:
-                continue
-            await self.resources.import_resources(
-                name,
-                spec.seed,
-                **dict(spec.import_options),
-            )
-
-    async def _call_setup_resources(self, ctx: ResourceContext) -> None:
-        hook = getattr(self.spider, "setup_resources", None)
-        if hook is None or self.resources is None:
-            return
-        await call_with_context(hook, self.resources, ctx)
+        await runtime.start()
+        self._resource_type_paths = resource_type_paths(runtime.adapters)
+        self.resources = ResourceManager(runtime.backend, self.settings)
+        await self.resources.start()
 
     async def _close_resources(self) -> None:
         if self.resources is not None:
-            await self.resources.close()
-            self.resources = None
+            try:
+                await self.resources.close()
+            finally:
+                self.resources = None
         if self._manager is not None:
             self._manager.shutdown()
             self._manager = None
-        if self.scheduler is not None:
-            self.scheduler.close()
-            self.scheduler = None
+        if self.resource_runtime is not None:
+            await self.resource_runtime.close()
+            self.resource_runtime = None
 
     def _build_task_queue(self) -> TaskQueue:
         if self.task_queue is not None:
@@ -354,10 +284,12 @@ class CrawlerEngine:
             await queue.put(result)
 
     async def _seed_tasks(self, queue: TaskQueue) -> None:
+        if self.resources is None:
+            raise ConfigError("resource manager was not initialized")
         seed_session = WorkerSession(
             manager=self.resources,
-            plan=self.spider.resource_plan,
             worker_id="seed",
+            heartbeat_interval=max(0.1, self.settings.lease_ttl / 3),
         )
         ctx = SpiderContext(
             spider=self.spider,
@@ -509,7 +441,11 @@ class CrawlerEngine:
         stats_queue = ctx.Queue()
         close_reason_queue = ctx.Queue()
 
-        scheduler_address = self.scheduler.address.to_env() if self.scheduler is not None else None
+        scheduler_address = (
+            self.resource_runtime.scheduler_address
+            if self.resource_runtime is not None
+            else None
+        )
         worker_config = {
             "settings": self.settings.to_dict(),
             "spider_path": object_path(self.spider_cls),

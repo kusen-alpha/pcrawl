@@ -19,7 +19,7 @@ start_urls ──> 基类 start_tasks ──> TaskQueue ──┐
 * `Request` / `Response`：独立调度、独立重试的 HTTP 单位，命名和用法与 Scrapy 对齐。
 * `TaskQueue` / `RequestQueue`：两类队列各自消费；worker 在两者之间轮转，任务与请求互不阻塞。
 * `start_urls` 默认走完整链路：基类 `start_tasks` 生成 `Task`，基类 `start_requests` 再生成 `Request`。只有重写 `start_tasks` / `start_requests` 时，对应阶段才走子类逻辑。
-* `ResourceSpec` / `ResourcePlan`：声明“要租什么”，不声明“资源是什么”。
+* `ResourceRuntime`：`start_resources(resources)` 收到的 purser 形状门面，负责 adapter、建池和导入；不声明“资源是什么”。
 * `WorkerSession`：一次 worker 会话的租约集合，加上 `session.user` 供 Spider 保存自己的浏览器/账号对象；回调中主要使用 `ctx.get_lease()` 和 `ctx.user`。
 * `LeaseHandle`：框架托管的租约视图，提供 `payload`、`resource`、`mark_used()`、`renew()`、`release()`。
 
@@ -232,7 +232,7 @@ TaskQueue ──claim Task──> start_requests(task, ctx) ──> RequestQueue
 ```
 
 * `Task`：只承载业务字段（`payload`、`route`、`priority`、重试计数），适合从数据库、文件、API 读取的批量工作。
-* `Request`：独立的 HTTP 调度单位，支持 `priority`、`route`、`resource_specs`、`callback`、`errback`、`cb_kwargs`、`dont_filter` 和独立重试。
+* `Request`：独立的 HTTP 调度单位，支持 `priority`、`route`、`resources`、`callback`、`errback`、`cb_kwargs`、`dont_filter` 和独立重试。
 * 两类队列由 worker 轮转消费：任务积压不会阻塞请求下载，请求积压也不会阻塞任务转换；多个 worker 下两者可以并行推进。
 
 ### 生产入口
@@ -294,40 +294,40 @@ settings = Settings(
 
 ## 资源会话
 
-资源类型不内置。用户只在 `start_resources` 中声明资源池、后端参数和初始记录，引擎按执行模式自动选择具体实现：
+资源类型不内置。`start_resources(resources)` 收到的 `resources` 是 `Purser` 形状的门面：`register_adapter()`、`create_pool()`、`import_resources()` 与 purser 原生签名一致。引擎按执行模式自动选择具体实现：
 
 * `inline` / `async`：进程内 `Purser`
 * `thread` / `process`：父进程 `LocalScheduler`，worker 通过 IPC 连接
-* 没有资源池：自动关闭资源后端
+* 没有创建池：自动关闭资源后端
 
 ```python
-from pcrawl import AsyncSpider, Item, PoolSpec, ResourceSetup, ResourceSpec, Settings, Task
+from pcrawl import AsyncSpider, Item, Settings, Task
+from purser import AcquireRequest
 
 
 class AccountSpider(AsyncSpider):
-    resources = {"account": ResourceSpec(pool="account", use_limit=10)}
-    settings = Settings(concurrency=2)
+    settings = Settings(concurrency=2, resource_wait_timeout=5)
 
-    async def start_resources(self):
-        return ResourceSetup(
-            pools={
-                "account": PoolSpec(
-                    kind="account",
-                    config={"max_slots": 1},
-                    seed=[
-                        {"id": "a1", "username": "u1"},
-                        {"id": "a2", "username": "u2"},
-                    ],
-                    import_options={"import_validate": "on_import"},
-                )
-            }
+    async def start_resources(self, resources):
+        resources.create_pool("account", "account", config={"max_slots": 1})
+        await resources.import_resources(
+            "account",
+            [
+                {"id": "a1", "username": "u1"},
+                {"id": "a2", "username": "u2"},
+            ],
+            import_validate="on_import",
         )
 
     def start_tasks(self):
         yield Task(payload={"query": "x"})
 
-    def open_session(self, session):
-        session.user["account"] = session.get("account").payload
+    async def open_session(self, session):
+        account = await session.acquire(
+            "account",
+            AcquireRequest(use_limit=10),
+        )
+        session.user["account"] = account.payload
 
     async def start_requests(self, task, ctx):
         # browser = await create_browser(ctx.user["account"])  # 用户代码
@@ -337,11 +337,23 @@ class AccountSpider(AsyncSpider):
         session.user.clear()
 ```
 
-`ResourceSetup` 还可以声明 `storage`、`coordination`、`sqlite_path`、`redis_url` 和 `adapters`。`PoolSpec.seed` 会在 worker 启动前导入一次；需要后端启动后再动态导入或生成数据时，可以覆写 `setup_resources(resources, ctx)`。不要在 `start_resources` 中返回 live `Purser` 或 `ResourcePool`，这样才能保证四种模式使用同一套写法。
+`session.acquire(pool, lease=None, **overrides)` 的第二个参数接受 `purser.AcquireRequest`、等价 mapping，或用关键字覆盖：
+
+```python
+await session.acquire("account", AcquireRequest(tags=["cn"], use_limit=10))
+await session.acquire("account", {"tags": ["cn"], "use_limit": 10})
+await session.acquire("account", use_limit=10)
+```
+
+`consumer` 由 pcrawl 按 `worker_id:session_id` 注入。请求级租约写在 `Request(resources={...})` 中，与 session 级使用同一个 `AcquireRequest` 形状。
+
+后端参数不再写在资源声明里，改用 `Settings(purser_storage=..., purser_coordination=..., purser_sqlite_path=..., purser_redis_url=...)`。`start_resources` 中的 `import_resources()` 会自动启动 embedded `Purser`，可以直接 `await` 数据库或 API 读取再导入。
+
+`start_resources` 只负责 provisioning，不创建 live 浏览器、账号连接或代理客户端；这些对象应在 `open_session` 取得租约后再创建。
 
 ### 自定义 Resource
 
-`PoolSpec.seed` 既接受普通 dict，也接受 `purser.core.resource.Resource` 子类实例。自定义类型通过 `ResourceSetup.adapters` 注册 adapter，`PoolSpec.kind` 必须与 `adapter.kind` 一致：
+`import_resources()` 既接受普通 dict，也接受 `purser.core.resource.Resource` 子类实例。自定义类型先注册 adapter，再创建同 `kind` 的池：
 
 ```python
 from dataclasses import dataclass
@@ -349,7 +361,7 @@ from typing import Annotated
 
 from purser.adapters.base import ResourceAdapter
 from purser.core.resource import PayloadField, Resource
-from pcrawl import AsyncSpider, PoolSpec, ResourceSetup, ResourceSpec
+from pcrawl import AsyncSpider
 
 
 @dataclass
@@ -365,36 +377,30 @@ class DeviceAdapter(ResourceAdapter):
 
 
 class DeviceSpider(AsyncSpider):
-    resources = {"device": ResourceSpec(pool="device", use_limit=10)}
-
-    async def start_resources(self):
-        # 这里可以 await 数据库/API 读取；返回 dict 或 Resource 均可
-        records = [{"id": "device-2", "serial": "SN-2", "region": "us"}]
-        return ResourceSetup(
-            pools={
-                "device": PoolSpec(
+    async def start_resources(self, resources):
+        resources.register_adapter(DeviceAdapter())
+        resources.create_pool("device", "device", config={"max_slots": 1})
+        await resources.import_resources(
+            "device",
+            [
+                {"id": "device-2", "serial": "SN-2", "region": "us"},
+                DeviceResource(
+                    id="device-1",
                     kind="device",
-                    config={"max_slots": 1},
-                    seed=records + [
-                        DeviceResource(
-                            id="device-1",
-                            kind="device",
-                            serial="SN-1",
-                            region="cn",
-                        )
-                    ],
-                    import_options={"import_validate": "on_import"},
-                )
-            },
-            adapters=(DeviceAdapter,),
+                    serial="SN-1",
+                    region="cn",
+                ),
+            ],
+            import_validate="on_import",
         )
 
-    def open_session(self, session):
+    async def open_session(self, session):
+        device = await session.acquire("device")
         # 四种模式统一从 payload 读取业务字段
-        session.user["device"] = session.get("device").payload
+        session.user["device"] = device.payload
 ```
 
-`start_resources` 只负责声明和导入资源，不创建 live 浏览器、账号连接或代理客户端；这些对象应在 `open_session` 取得租约后再创建。`LeaseHandle.resource` 在四种模式下都会恢复为 adapter 声明的资源类：`embedded` 直接复用原对象，`thread` / `process` 通过 adapter 的 `resource_class` 注册类型；进程模式要求资源类可从 `module:qualname` 导入，否则会退回通用 `Resource` 并以 `LeaseHandle.payload` 为准。`import_validate="on_import"` 让导入的资源立即可租；否则资源会保持 `NEW`，worker 会等待。`thread` / `process` 模式下的 adapter 应使用可导入的类或字符串路径，不要使用局部类、闭包或带不可序列化状态的实例。
+`LeaseHandle.resource` 在四种模式下都会恢复为 adapter 声明的资源类：`embedded` 直接复用原对象，`thread` / `process` 通过 adapter 的 `resource_class` 注册类型；进程模式要求资源类可从 `module:qualname` 导入，否则会退回通用 `Resource` 并以 `LeaseHandle.payload` 为准。`import_validate="on_import"` 让导入的资源立即可租；否则资源会保持 `NEW`，worker 会等待。`thread` / `process` 模式下的 adapter 应使用可导入的类或字符串路径，不要使用局部类、闭包或带不可序列化状态的实例。
 
 框架负责：
 
@@ -424,21 +430,14 @@ class DeviceSpider(AsyncSpider):
 `purser_mode` 默认是 `auto`。显式设置 `purser_mode="embedded"` 时，`thread` / `process` 会直接报错；普通项目不需要设置这个字段。
 
 ```python
-from pcrawl import MultiProcessSpider, PoolSpec, ResourceSetup, Settings
+from pcrawl import MultiProcessSpider, Settings
 
 
 class MyProcessSpider(MultiProcessSpider):
     settings = Settings(workers=4)
 
-    async def start_resources(self):
-        return ResourceSetup(
-            pools={
-                "account": PoolSpec(
-                    kind="account",
-                    config={"max_slots": 1},
-                )
-            }
-        )
+    async def start_resources(self, resources):
+        resources.create_pool("account", "account", config={"max_slots": 1})
 ```
 
 进程模式默认用 `multiprocessing.Manager` 同时共享任务队列和请求队列，适合本地示例和测试，但没有崩溃恢复。生产环境请使用 Redis（任务与请求队列会同时切换）：
@@ -469,8 +468,7 @@ class MyRedisProcessSpider(MultiProcessSpider):
 * `open_session(session)` / `close_session(session, reason)`：用户资源对象的创建和销毁。
 * `session_routes(session)`：该会话可以消费哪些 route。
 * `bind_resource(request, name, handle)`：把 request 级租约暴露给下载器中间件。
-* `start_resources(ctx)`：声明资源池、后端参数和初始记录；四种执行模式共用。
-* `setup_resources(resources, ctx)`：可选；后端启动后再动态导入/生成资源。
+* `start_resources(resources[, ctx])`：用 purser 原生 API 注册 adapter、创建池、导入记录；四种执行模式共用。
 * `on_task_error(task, exc, ctx)`：自定义任务失败处理。
 
 中间件和 Pipeline 的钩子同时兼容 Scrapy 写法和可选的 `ctx`：
@@ -553,7 +551,7 @@ pcrawl/
     runtime.py       # worker 主循环、session、请求处理
     spider.py        # Spider 内核、执行模式预设、SpiderContext
     settings.py      # 配置分层、Scrapy 风格访问器、项目 settings 模块
-    resources.py     # ResourceSetup/PoolSpec、WorkerSession、LeaseHandle、三种后端
+    resources.py     # ResourceRuntime/PoolHandle、WorkerSession、LeaseHandle、后端
     queue.py         # 任务/请求队列：memory / shared / redis
     http.py          # Request、Response、RequestFailure
     task.py          # Task

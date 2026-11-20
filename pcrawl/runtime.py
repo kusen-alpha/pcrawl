@@ -19,7 +19,7 @@ from .middleware import DownloaderMiddlewareManager, SpiderMiddlewareManager
 from .outcomes import ResourceOutcome
 from .pipeline import PipelineManager
 from .queue import RequestQueue, TaskQueue
-from .resources import LeaseHandle, ResourceManager, ResourceSpec, WorkerSession
+from .resources import LeaseHandle, ResourceManager, WorkerSession
 from .settings import Settings
 from .signals import (
     ITEM_SCRAPED,
@@ -63,15 +63,11 @@ class _RequestLeaseGroup:
         self.handles: list[tuple[str, LeaseHandle]] = []
 
     async def __aenter__(self) -> "_RequestLeaseGroup":
-        specs = {
-            name: ResourceSpec.from_value(value)
-            for name, value in self.request.resource_specs.items()
-        }
         try:
-            for name, spec in specs.items():
+            for name, lease in self.request.resources.items():
                 handle = await self.runtime.resources.acquire(
                     name,
-                    spec,
+                    lease,
                     consumer=f"{self.session.worker_id}:{self.session.id}:request",
                 )
                 await maybe_await(self.runtime.spider.bind_resource(self.request, name, handle))
@@ -90,7 +86,7 @@ class _RequestLeaseGroup:
         else:
             outcome = self.request.meta.get("pcrawl_resource_outcome", ResourceOutcome.OK)
         if not isinstance(outcome, ResourceOutcome):
-            outcome = ResourceOutcome(str(outcome))
+            outcome = ResourceOutcome(str(getattr(outcome, "value", outcome)))
         await self._release(outcome)
 
     async def _release(self, outcome: ResourceOutcome) -> None:
@@ -212,24 +208,12 @@ class WorkerRuntime:
         return None
 
     async def _open_session(self) -> WorkerSession:
-        plan = self.spider.resource_plan
         session = WorkerSession(
             manager=self.resources,
-            plan=plan,
             worker_id=self.worker_id,
+            heartbeat_interval=max(0.1, self.settings.lease_ttl / 3),
         )
         try:
-            for name, spec in plan.session_specs().items():
-                try:
-                    await session.acquire(name, spec)
-                except ResourceInvalid:
-                    raise
-                except Exception as exc:
-                    raise ResourceUnavailable(
-                        f"could not acquire session resource {name!r}: {exc}"
-                    ) from exc
-            if plan.session_specs():
-                session.start_heartbeat(max(0.1, self.settings.lease_ttl / 3))
             await maybe_await(self.spider.open_session(session))
         except ResourceInvalid as exc:
             session.invalidate(exc.outcome)
@@ -398,7 +382,7 @@ class WorkerRuntime:
         assert self.downloader is not None
 
         try:
-            if request.resource_specs:
+            if request.resources:
                 async with _RequestLeaseGroup(self, request, ctx.session, ctx):
                     response = await self._download_with_middlewares(request, ctx)
             else:

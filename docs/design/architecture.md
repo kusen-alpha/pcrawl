@@ -38,9 +38,9 @@ sequenceDiagram
     participant Q as Queues
     participant W as Workers
     E->>E: 合并 Settings、解析 execution_mode、validate
-    E->>E: start_resources(ctx)
+    E->>E: start_resources(resources)
+    E->>R: 注册 adapter、创建池、导入记录
     E->>R: 启动 embedded Purser 或 LocalScheduler
-    E->>R: 导入 seed、调用 setup_resources
     E->>E: open_spider()
     E->>Q: 打开任务/请求队列
     E->>Q: start_tasks / 无参 start_requests 预填
@@ -80,14 +80,14 @@ flowchart LR
 WorkerRuntime.run
 └── while 未停止:
     ├── 队列为空? → 退出或 keep_alive
-    ├── open_session: 获取 session 级租约、启动心跳、调用 Spider.open_session
+    ├── open_session: Spider.open_session 中 session.acquire(...)、按需启动心跳
     ├── _run_session:
     │   ├── claim task → start_requests → consume
     │   └── claim request → 请求级租约 → 下载 → parse → consume
     └── close_session: Spider.close_session → release_all
 ```
 
-会话级租约在 `open_session` 之前获取，请求级租约只在单次请求期间持有。`session.user` 是 worker 本地状态，用于放客户端、浏览器上下文等不可序列化对象。
+会话级租约由 Spider 在 `open_session` 中显式获取，请求级租约只在单次请求期间持有。`session.user` 是 worker 本地状态，用于放客户端、浏览器上下文等不可序列化对象。
 
 ## 模式差异
 
@@ -125,7 +125,7 @@ flowchart LR
 ## 设计约束
 
 - **模式由类决定**：`execution_mode` 不是配置项，避免“类一种、配置另一种”。
-- **资源声明可序列化**：`ResourceSetup` 不携带 live 对象，才能在四种模式复用。
+- **模式适配收进 `ResourceRuntime`**：Spider 只写 purser 原生 API，embedded/local 的差异由门面在运行期选择。
 - **资源对象归用户**：框架只托管租约，账号、浏览器、代理客户端由 Spider 创建和关闭。
 - **队列只做存储**：重试次数、延迟、优先级调整由 runtime 决定，队列只执行 claim/ack/nack。
 - **无资源可运行**：没有池时 `auto` 解析为 `off`，不导入 purser。
@@ -136,7 +136,7 @@ flowchart LR
 | --- | --- |
 | `pcrawl/engine.py` | 生命周期、模式解析、进程 supervisor |
 | `pcrawl/runtime.py` | claim、重试、会话、回调 |
-| `pcrawl/resources.py` | 资源声明、后端选择、租约视图 |
+| `pcrawl/resources.py` | 资源门面、后端选择、租约视图 |
 | `pcrawl/queue.py` | 内存/共享内存/Redis 队列 |
 | `pcrawl/spider.py` | Spider 基类与上下文 |
 | `pcrawl/settings.py` | 分层配置与别名 |

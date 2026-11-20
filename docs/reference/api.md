@@ -92,7 +92,7 @@ Request(
     priority: int = 0,
     dont_filter: bool = False,
     route: str = "",
-    resource_specs: dict[str, Any] = {},
+    resources: dict[str, Any] = {},
     retries: int = 0,
     max_retries: int | None = None,
     parent_task_id: str | None = None,
@@ -158,60 +158,33 @@ Settings.from_module(module, *, base=None)
 
 ## 资源
 
-### `ResourceSpec`
+### `ResourceRuntime`
+
+`start_resources(resources[, ctx])` 收到的门面，构造由引擎完成：
 
 ```python
-ResourceSpec(
-    pool: str,
-    scope: Literal["session", "request"] = "session",
-    tags: frozenset[str] = frozenset(),
-    slots: int = 1,
-    use_limit: int | None = None,
-    timeout: float | None = None,
-    required: bool = True,
-    required_tag: str | None = None,
-)
+resources.register_adapter(adapter)
+resources.create_pool(name, kind, *, config=None, profile=None, **overrides) -> PoolHandle
+await resources.import_resources(pool, records, **kwargs) -> ImportReport
+await resources.stats(pool)
 ```
 
-- `scope` 决定租约在会话期还是请求期持有；
-- `slots` 是单次租约占用的槽位数；
-- `use_limit` 超限抛 `ResourceInvalid(QUOTA_EXHAUSTED)`；
-- `required_tag` 传给后端按标签筛选；
-- `required` 字段当前保留，不影响调度行为。
+- `register_adapter()` 必须在任何 `create_pool()` 之前调用；
+- `create_pool()` / `import_resources()` 的签名与 purser 对齐；
+- `overrides` 直接传给 `Purser.create_pool`，`lease_ttl` 未指定时使用 `Settings.lease_ttl`；
+- 后端在首次声明池时按执行模式延迟创建；没有池时保持 `off`。
 
-`from_value()` 接受 `ResourceSpec`、池名字符串或映射。
+### `PoolHandle`
 
-### `PoolSpec`
+| 属性/方法 | 说明 |
+| --- | --- |
+| `name` / `kind` | 池标识 |
+| `import_resources(records, **kwargs)` | 导入记录，返回 `ImportReport` |
+| `stats()` | 池统计 |
 
-```python
-PoolSpec(
-    kind: str,
-    config: Mapping[str, Any] = {},
-    seed: tuple[Any, ...] | Mapping | None = (),
-    import_options: Mapping[str, Any] = {},
-)
-```
+### `ImportReport`
 
-`config` 传给 `Purser.create_pool`；`seed` 在池创建后导入；`import_options` 传给 `import_resources`。保持可序列化。
-
-### `ResourceSetup`
-
-```python
-ResourceSetup(
-    pools: Mapping[str, PoolSpec] = {},
-    storage: str | None = None,
-    coordination: str | None = None,
-    sqlite_path: str | None = None,
-    redis_url: str | None = None,
-    adapters: tuple[Any, ...] = (),
-)
-```
-
-`from_value()` 接受 `ResourceSetup` / 映射 / `None`；拒绝 live 对象。
-
-### `ResourcePlan`
-
-`ResourcePlan(specs={...})`，提供 `session_specs()` / `request_specs()` 分组。通常无需直接构造，`Spider.resources` 会自动转换。
+与 purser 导入报告同形：`imported`、`updated`、`skipped`、`errors`、`validation`、`batch_id`，以及只读 `total`。
 
 ### `LeaseHandle`
 
@@ -231,7 +204,7 @@ ResourceSetup(
 | 方法 | 说明 |
 | --- | --- |
 | `get(name)` / `session[name]` / `name in session` | 访问租约 |
-| `acquire(name, spec=None, **overrides)` | 获取额外租约 |
+| `acquire(pool, lease=None, **overrides)` | 获取 session 租约；`lease` 接受 `AcquireRequest` / mapping |
 | `release(name, outcome=None, used=None)` | 释放单个租约 |
 | `release_all(outcome=None)` | 停止心跳并按序释放全部租约 |
 | `invalidate(outcome)` | 标记会话全部租约为该 outcome |

@@ -101,9 +101,9 @@ async def _yield_one():
 class SessionSpider(Spider):
     name = "session"
     count = 5
-    resources = {"account": {"pool": "account"}}
 
-    async def setup_resources(self, resources):
+    async def start_resources(self, resources):
+        resources.create_pool("account", "account", config={"max_slots": 1})
         await resources.import_resources(
             "account",
             [
@@ -117,8 +117,8 @@ class SessionSpider(Spider):
         for index in range(self.count):
             yield Task(payload={"index": index})
 
-    def open_session(self, session):
-        session.user["account"] = session.get("account").payload
+    async def open_session(self, session):
+        session.user["account"] = (await session.acquire("account")).payload
 
     def start_requests(self, task, ctx):
         ctx.get_lease("account").mark_used()
@@ -139,32 +139,27 @@ class AsyncSessionSpider(SessionSpider):
 class AutoSessionSpider(AsyncSpider):
     name = "auto-session"
     count = 4
-    resources = {"account": {"pool": "account"}}
     seen_modes: list[str] = []
 
-    async def start_resources(self, ctx=None):
+    async def start_resources(self, resources, ctx=None):
         if ctx is not None:
             type(self).seen_modes.append(ctx.mode)
-        return {
-            "pools": {
-                "account": {
-                    "kind": "account",
-                    "config": {"max_slots": 1},
-                    "seed": [
-                        {"id": "auto-a1", "username": "auto-u1"},
-                        {"id": "auto-a2", "username": "auto-u2"},
-                    ],
-                    "import_options": {"import_validate": "on_import"},
-                }
-            }
-        }
+        resources.create_pool("account", "account", config={"max_slots": 1})
+        await resources.import_resources(
+            "account",
+            [
+                {"id": "auto-a1", "username": "auto-u1"},
+                {"id": "auto-a2", "username": "auto-u2"},
+            ],
+            import_validate="on_import",
+        )
 
     def start_tasks(self):
         for index in range(self.count):
             yield Task(payload={"index": index})
 
-    def open_session(self, session):
-        session.user["account"] = session.get("account").payload
+    async def open_session(self, session):
+        session.user["account"] = (await session.acquire("account")).payload
 
     def start_requests(self, task, ctx):
         ctx.get_lease("account").mark_used()

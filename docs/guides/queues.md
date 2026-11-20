@@ -67,7 +67,7 @@ def parse(self, response, ctx):
 | `priority` | 越大越先出队（priority 模式） |
 | `dont_filter` | 跳过去重 |
 | `route` | 路由名，决定 redis 的分桶 |
-| `resource_specs` | 请求级资源声明 |
+| `resources` | 请求级资源声明，key 为池名，value 为 `AcquireRequest` / mapping |
 | `retries` / `max_retries` | 重试状态 |
 
 ### 去重

@@ -4,16 +4,14 @@ import asyncio
 import logging
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass, field
-from typing import Any, Literal
+from dataclasses import dataclass, fields, is_dataclass
+from typing import Any
 
 from .exceptions import ConfigError, ResourceInvalid, ResourceUnavailable
 from .outcomes import ResourceOutcome
-from .settings import Settings
+from .settings import PurserMode, Settings
 
 logger = logging.getLogger("pcrawl.resources")
-
-ResourceScope = Literal["session", "request"]
 
 
 def resource_types_from_adapters(adapters: Any) -> dict[str, type]:
@@ -40,174 +38,296 @@ def resource_type_paths(adapters: Any) -> dict[str, str]:
     return paths
 
 
-@dataclass(frozen=True)
-class ResourceSpec:
-    """How one logical resource should be leased."""
+def lease_request_payload(value: Any) -> dict[str, Any]:
+    """Normalize a purser ``AcquireRequest`` or mapping into a JSON-safe dict."""
 
-    pool: str
-    scope: ResourceScope = "session"
-    tags: frozenset[str] = frozenset()
-    slots: int = 1
-    use_limit: int | None = None
-    timeout: float | None = None
-    required: bool = True
-    required_tag: str | None = None
-
-    def __post_init__(self) -> None:
-        if not self.pool:
-            raise ConfigError("ResourceSpec.pool cannot be empty")
-        if self.scope not in ("session", "request"):
-            raise ConfigError(f"unknown resource scope: {self.scope!r}")
-        if isinstance(self.tags, str):
-            object.__setattr__(self, "tags", frozenset({self.tags}))
-        else:
-            object.__setattr__(self, "tags", frozenset(self.tags))
-        if self.slots < 1:
-            raise ConfigError("ResourceSpec.slots must be >= 1")
-
-    @classmethod
-    def from_value(cls, value: Any) -> "ResourceSpec":
-        if isinstance(value, cls):
-            return value
-        if isinstance(value, str):
-            return cls(pool=value)
-        if isinstance(value, Mapping):
-            return cls(**dict(value))
-        raise TypeError(f"expected ResourceSpec or mapping, got {type(value)!r}")
-
-
-@dataclass(frozen=True)
-class PoolSpec:
-    """Declarative provisioning for one purser pool.
-
-    ``config`` is passed to ``Purser.create_pool``. ``seed`` is imported once
-    after the pool exists; each item may be a mapping or a purser ``Resource``
-    (including a custom subclass). Custom resource types must register a
-    matching adapter through ``ResourceSetup.adapters``. ``import_options`` is
-    forwarded to ``import_resources``. Keep this object serializable so the
-    engine can use the same declaration in embedded, thread and process modes.
-    """
-
-    kind: str
-    config: Mapping[str, Any] = field(default_factory=dict)
-    seed: tuple[Any, ...] = ()
-    import_options: Mapping[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if not self.kind:
-            raise ConfigError("PoolSpec.kind cannot be empty")
-        object.__setattr__(self, "config", dict(self.config or {}))
-        object.__setattr__(self, "import_options", dict(self.import_options or {}))
-        raw_seed = self.seed
-        if raw_seed is None:
-            raw_seed = ()
-        elif isinstance(raw_seed, Mapping):
-            raw_seed = (raw_seed,)
-        object.__setattr__(self, "seed", tuple(raw_seed))
-
-    @classmethod
-    def from_value(cls, value: Any) -> "PoolSpec":
-        if isinstance(value, cls):
-            return value
-        if isinstance(value, Mapping):
-            data = dict(value)
-            kind = data.pop("kind", None)
-            if not kind:
-                raise ConfigError("pool configuration requires a 'kind'")
-            seed = data.pop("seed", ())
-            import_options = data.pop("import_options", {})
-            config = dict(data.pop("config", {}) or {})
-            config.update(data)
-            return cls(
-                kind=str(kind),
-                config=config,
-                seed=seed,
-                import_options=import_options,
-            )
-        raise TypeError(f"expected PoolSpec or mapping, got {type(value)!r}")
-
-
-@dataclass(frozen=True)
-class ResourceSetup:
-    """Mode-neutral resource declaration returned by ``start_resources``.
-
-    The engine owns lifecycle and picks the concrete backend:
-    ``inline``/``async`` use an embedded purser, while ``thread``/``process``
-    use a parent-owned ``LocalScheduler``. ``adapters`` are registered before
-    pools start, so ``PoolSpec.seed`` may contain custom ``Resource`` types.
-    User code never receives or passes live ``Purser``/``ResourcePool``
-    objects.
-    """
-
-    pools: Mapping[str, PoolSpec] = field(default_factory=dict)
-    storage: str | None = None
-    coordination: str | None = None
-    sqlite_path: str | None = None
-    redis_url: str | None = None
-    adapters: tuple[Any, ...] = ()
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "pools",
-            {
-                str(name): PoolSpec.from_value(value)
-                for name, value in dict(self.pools or {}).items()
-            },
-        )
-        adapters = self.adapters
-        if adapters is None:
-            adapters = ()
-        elif isinstance(adapters, (str, bytes)):
-            adapters = (adapters,)
-        else:
-            try:
-                adapters = tuple(adapters)
-            except TypeError:
-                adapters = (adapters,)
-        object.__setattr__(self, "adapters", adapters)
-
-    @classmethod
-    def from_value(cls, value: Any) -> "ResourceSetup":
-        if value is None:
-            return cls()
-        if isinstance(value, cls):
-            return value
-        if isinstance(value, Mapping):
-            return cls(**dict(value))
+    if value is None:
+        return {}
+    if is_dataclass(value) and not isinstance(value, type):
+        data = {item.name: getattr(value, item.name) for item in fields(value)}
+    elif isinstance(value, Mapping):
+        data = dict(value)
+    else:
         raise TypeError(
-            "start_resources must return ResourceSetup or a mapping; "
-            "live Purser/ResourcePool objects are not supported"
+            "resource lease must be a purser AcquireRequest, mapping or None; "
+            f"got {type(value)!r}"
+        )
+    if isinstance(data.get("tags"), (set, frozenset)):
+        data["tags"] = sorted(data["tags"])
+    return data
+
+
+def _coerce_outcome(value: Any) -> ResourceOutcome:
+    if isinstance(value, ResourceOutcome):
+        return value
+    raw = getattr(value, "value", value)
+    try:
+        return ResourceOutcome(str(raw))
+    except ValueError as exc:
+        raise ValueError(f"unknown resource outcome: {value!r}") from exc
+
+
+@dataclass(frozen=True)
+class ImportReport:
+    """Backend-neutral view of one ``import_resources`` call."""
+
+    imported: int = 0
+    updated: int = 0
+    skipped: int = 0
+    errors: tuple[Mapping[str, Any], ...] = ()
+    validation: tuple[Mapping[str, Any], ...] = ()
+    batch_id: str | None = None
+
+    @property
+    def total(self) -> int:
+        return self.imported + self.updated + self.skipped + len(self.errors)
+
+    @classmethod
+    def from_value(cls, value: Any) -> "ImportReport":
+        if isinstance(value, cls):
+            return value
+        if is_dataclass(value) and not isinstance(value, type):
+            data = {item.name: getattr(value, item.name) for item in fields(value)}
+        elif isinstance(value, Mapping):
+            data = dict(value)
+        else:
+            return cls()
+        return cls(
+            imported=int(data.get("imported") or 0),
+            updated=int(data.get("updated") or 0),
+            skipped=int(data.get("skipped") or 0),
+            errors=tuple(data.get("errors") or ()),
+            validation=tuple(data.get("validation") or ()),
+            batch_id=data.get("batch_id"),
         )
 
 
-@dataclass
-class ResourcePlan:
-    """Logical name -> resource specification."""
+class PoolHandle:
+    """A purser-shaped pool handle exposing only provisioning operations."""
 
-    specs: dict[str, ResourceSpec] = field(default_factory=dict)
+    def __init__(self, runtime: "ResourceRuntime", name: str, kind: str) -> None:
+        self.runtime = runtime
+        self.name = name
+        self.kind = kind
 
-    def __post_init__(self) -> None:
-        self.specs = {
-            str(name): ResourceSpec.from_value(value)
-            for name, value in dict(self.specs).items()
-        }
+    async def import_resources(self, records: Any, **kwargs: Any) -> ImportReport:
+        return await self.runtime.import_resources(self.name, records, **kwargs)
 
-    def session_specs(self) -> dict[str, ResourceSpec]:
-        return {name: spec for name, spec in self.specs.items() if spec.scope == "session"}
+    async def stats(self) -> Any:
+        return await self.runtime.stats(self.name)
 
-    def request_specs(self) -> dict[str, ResourceSpec]:
-        return {name: spec for name, spec in self.specs.items() if spec.scope == "request"}
+    def __repr__(self) -> str:
+        return f"PoolHandle(name={self.name!r}, kind={self.kind!r})"
 
-    @classmethod
-    def from_value(cls, value: Any) -> "ResourcePlan":
-        if value is None:
-            return cls()
-        if isinstance(value, cls):
-            return value
-        if isinstance(value, Mapping):
-            return cls(dict(value))
-        raise TypeError(f"resources must be a ResourcePlan or mapping, got {type(value)!r}")
+
+class ResourceRuntime:
+    """Purser-shaped resource facade handed to ``Spider.start_resources``.
+
+    The facade owns the concrete backend selected from the execution mode:
+    embedded ``Purser`` for inline/async, parent-owned ``LocalScheduler`` for
+    thread/process. It is created lazily on the first adapter/pool declaration,
+    so spiders without resources never import purser.
+    """
+
+    def __init__(self, settings: Settings, mode: str) -> None:
+        self.settings = settings
+        self.mode = mode
+        self._adapters: list[Any] = []
+        self._pools: dict[str, PoolHandle] = {}
+        self._purser: Any = None
+        self._purser_pools: dict[str, Any] = {}
+        self._scheduler: Any = None
+        self._backend: ResourceBackend | None = None
+        self._resolved: PurserMode | None = None
+        self._started = False
+        self._closed = False
+
+        if settings.purser_mode == "embedded" and mode in ("thread", "process"):
+            raise ConfigError(
+                "embedded purser cannot be shared across threads/processes; "
+                "use purser_mode='local' or leave it on 'auto'"
+            )
+
+    def register_adapter(self, adapter: Any) -> None:
+        if self._pools:
+            raise ConfigError("register adapters before creating pools")
+        self._adapters.append(adapter)
+
+    def create_pool(
+        self,
+        name: str,
+        kind: str,
+        *,
+        config: Mapping[str, Any] | None = None,
+        profile: Any = None,
+        **overrides: Any,
+    ) -> PoolHandle:
+        name = str(name)
+        if name in self._pools:
+            raise ConfigError(f"pool {name!r} is already declared")
+        self._ensure_backend(declaring=True)
+        options = dict(overrides)
+        options.setdefault("lease_ttl", self.settings.lease_ttl)
+
+        if self._purser is not None:
+            pool = self._purser.create_pool(
+                name,
+                kind,
+                config=config,
+                profile=profile,
+                **options,
+            )
+            self._purser_pools[name] = pool
+        else:
+            self._scheduler.create_pool(
+                name,
+                kind,
+                config=config,
+                profile=profile,
+                **options,
+            )
+
+        handle = PoolHandle(self, name, str(kind))
+        self._pools[name] = handle
+        return handle
+
+    async def import_resources(
+        self,
+        pool: str,
+        records: Any,
+        **kwargs: Any,
+    ) -> ImportReport:
+        if pool not in self._pools:
+            raise ConfigError(
+                f"unknown pool {pool!r}; declared pools: {sorted(self._pools)}"
+            )
+        await self.start()
+        if self._purser is not None:
+            report = await self._purser_pools[pool].import_resources(
+                records,
+                **kwargs,
+            )
+        else:
+            report = await asyncio.to_thread(
+                self._scheduler.import_resources,
+                pool,
+                records,
+                **kwargs,
+            )
+        return ImportReport.from_value(report)
+
+    async def stats(self, pool: str) -> Any:
+        if pool not in self._pools:
+            raise ConfigError(
+                f"unknown pool {pool!r}; declared pools: {sorted(self._pools)}"
+            )
+        await self.start()
+        if self._purser is not None:
+            return await self._purser_pools[pool].stats()
+        return await asyncio.to_thread(self._scheduler.stats, pool)
+
+    async def start(self) -> None:
+        if self._resolved is None:
+            self._resolved = self._resolve_mode()
+        if self._purser is not None and not self._started:
+            await self._purser.start()
+        self.settings.purser_mode = self._resolved
+        self._started = True
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._purser is not None:
+            await self._purser.close()
+        if self._scheduler is not None:
+            await asyncio.to_thread(self._scheduler.close)
+        self._purser = None
+        self._scheduler = None
+
+    @property
+    def resolved_mode(self) -> PurserMode:
+        return self._resolved or self._resolve_mode()
+
+    @property
+    def adapters(self) -> tuple[Any, ...]:
+        return tuple(self._adapters)
+
+    @property
+    def pool_names(self) -> tuple[str, ...]:
+        return tuple(self._pools)
+
+    @property
+    def scheduler_address(self) -> str | None:
+        if self._scheduler is None:
+            return None
+        return self._scheduler.address.to_env()
+
+    @property
+    def backend(self) -> ResourceBackend:
+        if self._backend is None:
+            self._backend = self._make_backend()
+        return self._backend
+
+    def _resolve_mode(self, *, declaring: bool = False) -> PurserMode:
+        if not self._pools and not declaring:
+            return "off"
+        configured = self.settings.purser_mode
+        if configured != "auto":
+            return configured
+        return "embedded" if self.mode in ("inline", "async") else "local"
+
+    def _ensure_backend(self, *, declaring: bool = False) -> None:
+        if self._resolved is not None:
+            if declaring and self._resolved == "off":
+                raise ConfigError(
+                    "resource pools were declared but purser_mode is 'off'"
+                )
+            return
+        mode = self._resolve_mode(declaring=declaring)
+        if mode == "off":
+            raise ConfigError(
+                "resource pools were declared but purser_mode is 'off'"
+            )
+        if mode == "embedded":
+            from purser import Purser
+
+            self._purser = Purser(
+                storage=self.settings.purser_storage,
+                coordination=self.settings.purser_coordination,
+                sqlite_path=self.settings.purser_sqlite_path,
+                redis_url=self.settings.purser_redis_url,
+            )
+            for adapter in self._adapters:
+                self._purser.register_adapter(adapter)
+        elif mode == "local":
+            from purser.local import LocalScheduler
+
+            self._scheduler = LocalScheduler(
+                storage=self.settings.purser_storage,
+                coordination=self.settings.purser_coordination,
+                sqlite_path=self.settings.purser_sqlite_path,
+                redis_url=self.settings.purser_redis_url,
+                start_method=self.settings.purser_start_method,
+                adapters=tuple(self._adapters),
+            )
+            self._scheduler.start()
+        self._resolved = mode
+
+    def _make_backend(self) -> ResourceBackend:
+        if self._purser is not None:
+            return _EmbeddedBackend(
+                self.settings,
+                purser=self._purser,
+                pools=self._purser_pools,
+            )
+        if self._scheduler is not None:
+            return _LocalBackend(
+                self._scheduler.address,
+                self.settings,
+                resource_types=resource_types_from_adapters(self._adapters),
+            )
+        return _NoopBackend()
 
 
 class LeaseHandle:
@@ -275,8 +395,8 @@ class LeaseHandle:
         if self.use_limit is not None and self._used > self.use_limit:
             raise ResourceInvalid(ResourceOutcome.QUOTA_EXHAUSTED)
 
-    def set_outcome(self, outcome: ResourceOutcome) -> None:
-        self.outcome = outcome
+    def set_outcome(self, outcome: Any) -> None:
+        self.outcome = _coerce_outcome(outcome)
 
     async def renew(self) -> bool:
         if self.released:
@@ -285,13 +405,13 @@ class LeaseHandle:
 
     async def release(
         self,
-        outcome: ResourceOutcome | None = None,
+        outcome: Any = None,
         used: int | None = None,
     ) -> bool:
         if self.released:
             return True
         if outcome is not None:
-            self.outcome = outcome
+            self.outcome = _coerce_outcome(outcome)
         self.released = True
         return await self._backend.release(
             self,
@@ -311,17 +431,17 @@ class WorkerSession:
         self,
         *,
         manager: "ResourceManager",
-        plan: ResourcePlan,
         worker_id: str,
+        heartbeat_interval: float | None = None,
     ) -> None:
         self.id = uuid.uuid4().hex
         self.manager = manager
-        self.plan = plan
         self.worker_id = worker_id
         self.leases: dict[str, LeaseHandle] = {}
         self.user: dict[str, Any] = {}
         self.outcome = ResourceOutcome.OK
         self.heartbeat_error: BaseException | None = None
+        self._heartbeat_interval = heartbeat_interval
         self._heartbeat_task: asyncio.Task[None] | None = None
 
     def get(self, name: str) -> LeaseHandle:
@@ -339,30 +459,34 @@ class WorkerSession:
 
     async def acquire(
         self,
-        name: str,
-        spec: ResourceSpec | Mapping[str, Any] | None = None,
+        pool: str,
+        request: Any = None,
         **overrides: Any,
     ) -> LeaseHandle:
-        if name in self.leases:
-            return self.leases[name]
-        if spec is None:
-            spec = self.plan.specs.get(name)
-        if spec is None:
-            raise ConfigError(f"no resource spec for {name!r}")
-        spec = ResourceSpec.from_value(spec)
-        handle = await self.manager.acquire(
-            name,
-            spec,
-            consumer=f"{self.worker_id}:{self.id}",
-            **overrides,
-        )
-        self.leases[name] = handle
+        if pool in self.leases:
+            return self.leases[pool]
+        try:
+            handle = await self.manager.acquire(
+                pool,
+                request,
+                consumer=f"{self.worker_id}:{self.id}",
+                **overrides,
+            )
+        except (ResourceInvalid, ResourceUnavailable):
+            raise
+        except Exception as exc:
+            raise ResourceUnavailable(
+                f"could not acquire session resource {pool!r}: {exc}"
+            ) from exc
+        self.leases[pool] = handle
+        if self._heartbeat_interval is not None:
+            self.start_heartbeat(self._heartbeat_interval)
         return handle
 
     async def release(
         self,
         name: str,
-        outcome: ResourceOutcome | None = None,
+        outcome: Any = None,
         used: int | None = None,
     ) -> bool:
         handle = self.leases.pop(name, None)
@@ -370,10 +494,11 @@ class WorkerSession:
             return True
         return await handle.release(outcome=outcome, used=used)
 
-    def invalidate(self, outcome: ResourceOutcome) -> None:
-        self.outcome = outcome
+    def invalidate(self, outcome: Any) -> None:
+        final = _coerce_outcome(outcome)
+        self.outcome = final
         for handle in self.leases.values():
-            handle.set_outcome(outcome)
+            handle.set_outcome(final)
 
     def start_heartbeat(self, interval: float) -> None:
         if self._heartbeat_task is not None or not self.leases:
@@ -407,9 +532,9 @@ class WorkerSession:
                         exc,
                     )
 
-    async def release_all(self, outcome: ResourceOutcome | None = None) -> None:
+    async def release_all(self, outcome: Any = None) -> None:
         await self.stop_heartbeat()
-        final_outcome = outcome or self.outcome
+        final_outcome = self.outcome if outcome is None else _coerce_outcome(outcome)
         for name in reversed(list(self.leases)):
             try:
                 await self.release(name, outcome=final_outcome)
@@ -429,15 +554,7 @@ class ResourceBackend:
         self,
         pool: str,
         *,
-        name: str,
-        tags: frozenset[str],
-        slots: int,
-        use_limit: int | None,
-        timeout: float | None,
-        consumer: str,
-        resource_id: str | None = None,
-        required_tag: str | None = None,
-        **kwargs: Any,
+        request: Mapping[str, Any],
     ) -> LeaseHandle:
         raise NotImplementedError
 
@@ -461,10 +578,15 @@ class ResourceBackend:
 
 
 class _NoopBackend(ResourceBackend):
-    async def acquire(self, pool: str, **kwargs: Any) -> LeaseHandle:
+    async def acquire(
+        self,
+        pool: str,
+        *,
+        request: Mapping[str, Any],
+    ) -> LeaseHandle:
         raise ResourceUnavailable(
-            "resource backend is off; return ResourceSetup from start_resources "
-            "or set purser_mode='embedded'/'local'"
+            "resource backend is off; call resources.create_pool(...) in "
+            "start_resources or set purser_mode='embedded'/'local'"
         )
 
     async def release(self, handle: LeaseHandle, *, outcome: ResourceOutcome, used: int) -> bool:
@@ -478,88 +600,41 @@ class _NoopBackend(ResourceBackend):
 
 
 class _EmbeddedBackend(ResourceBackend):
+    """Backend view over a Purser owned by ``ResourceRuntime``."""
+
     def __init__(
         self,
         settings: Settings,
-        setup: ResourceSetup | None = None,
+        *,
+        purser: Any,
+        pools: Mapping[str, Any],
     ) -> None:
         self.settings = settings
-        self.setup = setup or ResourceSetup()
-        self._purser: Any = None
-        self._pools: dict[str, Any] = {}
-
-    def _pool_specs(self) -> dict[str, PoolSpec]:
-        if self.setup.pools:
-            return dict(self.setup.pools)
-        return {
-            name: PoolSpec.from_value(value)
-            for name, value in self.settings.purser_pools.items()
-        }
-
-    async def start(self) -> None:
-        from purser import Purser
-
-        setup = self.setup
-        self._purser = Purser(
-            storage=setup.storage or self.settings.purser_storage,
-            coordination=setup.coordination or self.settings.purser_coordination,
-            sqlite_path=setup.sqlite_path or self.settings.purser_sqlite_path,
-            redis_url=setup.redis_url or self.settings.purser_redis_url,
-        )
-        for adapter in setup.adapters:
-            self._purser.register_adapter(adapter)
-        await self._purser.start()
-        for name, spec in self._pool_specs().items():
-            config = dict(spec.config)
-            config.setdefault("lease_ttl", self.settings.lease_ttl)
-            self._pools[name] = self._purser.create_pool(
-                name,
-                spec.kind,
-                config=config,
-            )
+        self._purser = purser
+        self._pools = dict(pools)
 
     async def close(self) -> None:
-        if self._purser is not None:
-            await self._purser.close()
-            self._purser = None
-            self._pools.clear()
+        # ResourceRuntime owns the Purser lifecycle.
+        return None
 
     async def acquire(
         self,
         pool: str,
         *,
-        name: str,
-        tags: frozenset[str],
-        slots: int,
-        use_limit: int | None,
-        timeout: float | None,
-        consumer: str,
-        resource_id: str | None = None,
-        required_tag: str | None = None,
-        **kwargs: Any,
+        request: Mapping[str, Any],
     ) -> LeaseHandle:
-        from purser.core.resource import AcquireRequest
+        from purser import AcquireRequest
 
         pool_obj = self._pools.get(pool)
         if pool_obj is None:
             raise ResourceUnavailable(f"unknown purser pool {pool!r}")
-        request = AcquireRequest(
-            consumer=consumer,
-            tags=tags,
-            slots=slots,
-            use_limit=use_limit,
-            timeout=timeout,
-            resource_id=resource_id,
-            required_tag=required_tag,
-            **kwargs,
-        )
-        raw = await pool_obj.acquire(request)
+        raw = await pool_obj.acquire(AcquireRequest(**dict(request)))
         return LeaseHandle(
-            name=name,
+            name=pool,
             pool=pool,
             raw=raw,
             backend=self,
-            use_limit=use_limit,
+            use_limit=request.get("use_limit"),
         )
 
     async def release(
@@ -617,39 +692,22 @@ class _LocalBackend(ResourceBackend):
         self,
         pool: str,
         *,
-        name: str,
-        tags: frozenset[str],
-        slots: int,
-        use_limit: int | None,
-        timeout: float | None,
-        consumer: str,
-        resource_id: str | None = None,
-        required_tag: str | None = None,
-        **kwargs: Any,
+        request: Mapping[str, Any],
     ) -> LeaseHandle:
-        request = {
-            "consumer": consumer,
-            "tags": sorted(tags),
-            "slots": slots,
-            "use_limit": use_limit,
-            "timeout": timeout,
-            "resource_id": resource_id,
-            "required_tag": required_tag,
-            **kwargs,
-        }
-        request = {key: value for key, value in request.items() if value is not None}
+        payload = dict(request)
+        payload = {key: value for key, value in payload.items() if value is not None}
         raw = await asyncio.to_thread(
             self._client.acquire,
             pool,
-            request,
-            timeout=timeout,
+            payload,
+            timeout=payload.get("timeout"),
         )
         return LeaseHandle(
-            name=name,
+            name=pool,
             pool=pool,
             raw=raw,
             backend=self,
-            use_limit=use_limit,
+            use_limit=request.get("use_limit"),
         )
 
     async def release(
@@ -698,24 +756,16 @@ class ResourceManager:
 
     async def acquire(
         self,
-        name: str,
-        spec: ResourceSpec,
+        pool: str,
+        request: Any = None,
         *,
         consumer: str,
         **overrides: Any,
     ) -> LeaseHandle:
-        return await self.backend.acquire(
-            spec.pool,
-            name=name,
-            tags=spec.tags,
-            slots=spec.slots,
-            use_limit=spec.use_limit,
-            timeout=spec.timeout,
-            consumer=consumer,
-            resource_id=overrides.pop("resource_id", None),
-            required_tag=overrides.pop("required_tag", spec.required_tag),
-            **overrides,
-        )
+        payload = lease_request_payload(request)
+        payload.update(overrides)
+        payload["consumer"] = consumer
+        return await self.backend.acquire(pool, request=payload)
 
     async def import_resources(self, pool: str, records: Any, **kwargs: Any) -> Any:
         return await self.backend.import_resources(pool, records, **kwargs)
@@ -727,19 +777,19 @@ class ResourceManager:
 def make_backend(
     settings: Settings,
     scheduler: Any = None,
-    setup: ResourceSetup | None = None,
     resource_types: dict[str, type] | None = None,
 ) -> ResourceBackend:
     if settings.purser_mode == "off":
         return _NoopBackend()
-    if settings.purser_mode == "embedded":
-        return _EmbeddedBackend(settings, setup)
     if settings.purser_mode == "local":
         if scheduler is None:
             raise ConfigError("purser_mode='local' requires a started LocalScheduler")
-        if resource_types is None and setup is not None:
-            resource_types = resource_types_from_adapters(setup.adapters)
         return _LocalBackend(scheduler.address, settings, resource_types)
+    if settings.purser_mode == "embedded":
+        raise ConfigError(
+            "embedded purser is owned by ResourceRuntime; workers must use "
+            "purser_mode='local' or 'off'"
+        )
     if settings.purser_mode == "auto":
         raise ConfigError("purser_mode='auto' must be resolved before creating a backend")
     raise ConfigError(f"unknown purser_mode: {settings.purser_mode!r}")

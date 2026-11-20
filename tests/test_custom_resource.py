@@ -5,16 +5,7 @@ from typing import Annotated
 
 import pytest
 
-from pcrawl import (
-    AsyncSpider,
-    CrawlerEngine,
-    Item,
-    PoolSpec,
-    ResourceSetup,
-    ResourceSpec,
-    Settings,
-    Task,
-)
+from pcrawl import AsyncSpider, CrawlerEngine, Item, Settings, Task
 
 purser_resources = pytest.importorskip("purser.core.resource")
 purser_adapters = pytest.importorskip("purser.adapters.base")
@@ -39,35 +30,30 @@ class DeviceAdapter(ResourceAdapter):
 class CustomResourceSpider(AsyncSpider):
     name = "custom-resource"
     count = 3
-    resources = {"device": ResourceSpec(pool="device", use_limit=10)}
 
-    async def start_resources(self):
-        return ResourceSetup(
-            pools={
-                "device": PoolSpec(
+    async def start_resources(self, resources):
+        resources.register_adapter(DeviceAdapter())
+        resources.create_pool("device", "device", config={"max_slots": 1})
+        await resources.import_resources(
+            "device",
+            [
+                DeviceResource(
+                    id="device-1",
                     kind="device",
-                    config={"max_slots": 1},
-                    seed=[
-                        DeviceResource(
-                            id="device-1",
-                            kind="device",
-                            serial="serial-1",
-                            region="cn",
-                        ),
-                        {"id": "device-2", "serial": "serial-2", "region": "us"},
-                    ],
-                    import_options={"import_validate": "on_import"},
-                )
-            },
-            adapters=(DeviceAdapter,),
+                    serial="serial-1",
+                    region="cn",
+                ),
+                {"id": "device-2", "serial": "serial-2", "region": "us"},
+            ],
+            import_validate="on_import",
         )
 
     def start_tasks(self):
         for index in range(self.count):
             yield Task(payload={"index": index})
 
-    def open_session(self, session):
-        device = session.get("device")
+    async def open_session(self, session):
+        device = await session.acquire("device", {"use_limit": 10})
         assert type(device.resource).__name__ == "DeviceResource"
         session.user["device_id"] = device.resource_id
         session.user["device_serial"] = device.payload["serial"]
